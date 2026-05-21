@@ -10,9 +10,6 @@ from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Prime Conduit PDF Extractor", page_icon="📊", layout="wide")
 
-# Fixed output header. Removed unwanted columns:
-# meta_data_json, Commission_Rate, currency, rawcustname
-# SO_Number is kept blank if present in your template logic.
 HEADERS = [
     "Distname", "Supplier_name", "direct_indirect", "in_out_territory",
     "CustAccNbr", "CustDunsNumber", "CustName", "Address1", "City", "State",
@@ -36,7 +33,9 @@ INVOICE_RE = re.compile(r"\b9\d{7,8}\b")
 ACCOUNT_RE = re.compile(r"^(\d{5,6})\s*-\s*(.+)$")
 STATE_RE = re.compile(r"\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)\b")
 MONEY_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d{2})-?")
-DATE_RE = re.compile(r"Commission Customer Report For Period\s*:\s*(\d{2})/(\d{2})/(\d{4})\s*to\s*(\d{2})/(\d{2})/(\d{4})")
+DATE_RE = re.compile(
+    r"Commission Customer Report For Period\s*:\s*(\d{2})/(\d{2})/(\d{4})\s*to\s*(\d{2})/(\d{2})/(\d{4})"
+)
 
 SKIP_WORDS = (
     "ZSDB0010", "Commission Customer Report", "Commission Group Report",
@@ -83,14 +82,14 @@ def is_group_header(line):
 
 
 def parse_report_date(full_text):
+    # FIXED: always returns 5 values.
     m = DATE_RE.search(full_text)
     if not m:
-        return "", "", "", ""
+        return "", "", "", "", ""
+
     start_m, start_d, start_y, end_m, end_d, end_y = m.groups()
     invoice_date = f"{end_m}/{end_d}/{end_y}"
-    pay_month = end_m
-    pay_year = end_y
-    return invoice_date, pay_month, pay_year, end_m, end_y
+    return invoice_date, end_m, end_y, end_m, end_y
 
 
 def parse_invoice_line(line):
@@ -102,8 +101,6 @@ def parse_invoice_line(line):
     dist_on_same_line = clean(line[:m.start()])
     rest = clean(line[m.end():])
 
-    # Normal Prime customer rows after invoice:
-    # Net Value, Discount/Freight, Commission Basis, Rate, Commission Total
     nums = MONEY_RE.findall(rest)
 
     net_value = ""
@@ -114,9 +111,9 @@ def parse_invoice_line(line):
         net_value = to_float(nums[0])
         commission_basis = to_float(nums[2])
         commission_total = to_float(nums[-1])
-    elif len(nums) >= 4:
+    elif len(nums) >= 3:
         net_value = to_float(nums[0])
-        commission_basis = to_float(nums[1])
+        commission_basis = to_float(nums[-2])
         commission_total = to_float(nums[-1])
     elif nums:
         commission_total = to_float(nums[-1])
@@ -131,11 +128,6 @@ def parse_invoice_line(line):
 
 
 def parse_city_state_order_po(line):
-    """
-    Handles both:
-    MINNEAPOLIS MN 2368091 P001829508 1,089.84
-    2368092 P001829516 1,910.06
-    """
     line = clean(line)
     city = ""
     state = ""
@@ -162,7 +154,7 @@ def parse_city_state_order_po(line):
 
 
 def find_next_account(lines, start_index):
-    for j in range(start_index, min(start_index + 7, len(lines))):
+    for j in range(start_index, min(start_index + 8, len(lines))):
         m = ACCOUNT_RE.search(clean(lines[j]))
         if m:
             return m.group(1), clean(m.group(2))
@@ -191,9 +183,6 @@ def extract_rows_from_text(text):
             next_line = clean(lines[i + 1]) if i + 1 < len(lines) else ""
             city, state, order_no, po_no = parse_city_state_order_po(next_line)
 
-            # IMPORTANT FIX:
-            # If city/state are not printed on every invoice row, carry forward the
-            # last valid city/state from the customer block.
             if city:
                 current_city = city
             if state:
@@ -201,19 +190,14 @@ def extract_rows_from_text(text):
 
             cust_acc, cust_name = find_next_account(lines, i + 1)
 
-            # IMPORTANT FIX:
-            # CustName must come from "123456 - Customer Name" line.
-            # Never leave CustName blank if account exists.
             if not cust_name:
                 cust_name = current_dist
 
             row = {h: "" for h in HEADERS}
-
             row.update({
                 "Distname": current_dist,
                 "Supplier_name": "Prime",
                 "direct_indirect": "Indirect",
-                "in_out_territory": "",
                 "CustAccNbr": cust_acc,
                 "CustName": cust_name,
                 "City": current_city,
@@ -222,7 +206,6 @@ def extract_rows_from_text(text):
                 "UOM": "EA",
                 "InvoiceNumber": parsed["invoice"],
                 "Qty": 1,
-                # Book5 mapping: UnitCost should be commission basis
                 "UnitCost": parsed["commission_basis"],
                 "UnitResale": parsed["net_value"],
                 "InvoiceDate": invoice_date,
@@ -233,9 +216,6 @@ def extract_rows_from_text(text):
                 "Ship_Year": ship_year,
                 "Commissions": parsed["commission_total"],
                 "CommissionRate": "",
-                "Sales": "",
-                "In_Out": "",
-                "CommissionNotes": "",
                 "Distributor": current_dist,
                 "Billings": parsed["commission_basis"],
                 "SO_Number": "",
@@ -248,21 +228,22 @@ def extract_rows_from_text(text):
         if is_group_header(line):
             current_dist = line
 
-            # Look ahead for a city/state line. This fixes blocks where only the
-            # first invoice has city/state and following invoices omit it.
-            for j in range(i + 1, min(i + 5, len(lines))):
+            for j in range(i + 1, min(i + 6, len(lines))):
                 probe = clean(lines[j])
-                if INVOICE_RE.search(probe):
-                    city, state, _, _ = parse_city_state_order_po(clean(lines[j + 1]) if j + 1 < len(lines) else "")
-                    if city:
-                        current_city = city
-                    if state:
-                        current_state = state
-                    break
+
                 sm = STATE_RE.search(probe)
                 if sm and not ACCOUNT_RE.search(probe):
                     current_city = clean(probe[:sm.start()])
                     current_state = sm.group(1)
+                    break
+
+                if INVOICE_RE.search(probe):
+                    nline = clean(lines[j + 1]) if j + 1 < len(lines) else ""
+                    city, state, _, _ = parse_city_state_order_po(nline)
+                    if city:
+                        current_city = city
+                    if state:
+                        current_state = state
                     break
 
     return rows
@@ -270,13 +251,13 @@ def extract_rows_from_text(text):
 
 def extract_pdf(uploaded_files):
     all_rows = []
+
     for file in uploaded_files:
         with pdfplumber.open(file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
                 all_rows.extend(extract_rows_from_text(text))
 
-    # Deduplicate safely
     seen = set()
     final_rows = []
     for r in all_rows:
@@ -284,6 +265,7 @@ def extract_pdf(uploaded_files):
         if key not in seen:
             seen.add(key)
             final_rows.append(r)
+
     return final_rows
 
 
