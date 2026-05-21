@@ -1,5 +1,4 @@
 import re
-import json
 from io import BytesIO
 
 import pdfplumber
@@ -8,185 +7,194 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(
-    page_title="Prime Conduit PDF Extractor",
-    page_icon="📊",
-    layout="wide",
-)
 
-BOOK4_HEADERS = [
-    "Distname", "Supplier_name", "direct_indirect", "in_out_territory", "CustAccNbr",
-    "CustDunsID", "CustName", "Address1", "City", "State", "County", "Zip", "Phone",
-    "Country", "NoOfEmployees", "WebAddress", "SIC", "NAICS", "LineOfBusiness",
-    "ParentName", "AccountType", "UOM", "InvoiceNumber", "Qty", "UnitCost", "UnitResale",
-    "InvoiceDate", "DateRecieved", "PartNumberSubmitted", "PartNumberDescription", "Branch",
-    "SalesRep", "Latitude", "Longitude", "Brand", "PartNumberActual", "UPCCode", "rawcustname",
-    "rawdistaddress", "rawdistcity", "rawdiststate", "rawdistpostalcode", "rawdistcountry",
-    "currency", "contractID", "client_CustName", "Zip_4_digit", "dnb_trade_style",
-    "dnb_sales_value", "google_CustName", "google_Address1", "google_State", "google_Zip",
-    "google_Country", "google_Phone", "google_WebAddress", "Pay_Month", "Pay_Year",
-    "Ship_Month", "Ship_Year", "Industry", "Commissions", "Commission_Rate", "Cust_AM",
-    "CEM", "Sales", "In_Out", "Commission_split_percentage", "Distributor_part_number",
-    "Category", "google_City", "Billings", "Cheque_Number", "Pay_Date", "meta_data_json",
-    "SO_Number", "PO_Number", "ship_date", "searched_on_google"
-]
+st.set_page_config(page_title="Prime Conduit PDF Extractor", page_icon="📊", layout="wide")
 
-PREVIEW_COLUMNS = [
-    "Supplier_name", "CustAccNbr", "CustName", "City", "State", "InvoiceNumber",
-    "Qty", "UnitCost", "Commissions", "SO_Number", "PO_Number"
-]
+FIXED_HEADERS = ['Distname', 'Supplier_name', 'direct_indirect', 'in_out_territory', 'CustAccNbr', 'CustDunsNumber', 'CustName', 'Address1', 'City', 'State', 'County', 'Zip', 'Phone', 'Country', 'NoOfEmployees', 'WebAddress', 'SIC', 'NAICS', 'LineOfBusiness', 'ParentName', 'AccountType', 'UOM', 'InvoiceNumber', 'Qty', 'UnitCost', 'UnitResale', 'InvoiceDate', 'DateReceived', 'PartNumber', 'PartNumberDesc', 'Branch', 'SalesRep', 'Latitude', 'Longitude', 'Brand', 'PartNumber2', 'UPCCode', 'rawcustname', 'rawdistaddress', 'rawdistcity', 'rawdiststate', 'rawdistpostal', 'rawdistcountry', 'contractID', 'client_CustNumber', 'Zip_4_digits', 'dnb_tradestyle', 'dnb_sales_volume', 'google_CustName', 'google_Address', 'google_State', 'google_Zip', 'google_Country', 'google_Phone', 'google_WebAddress', 'Pay_Month', 'Pay_Year', 'Ship_Month', 'Ship_Year', 'Industry', 'Commissions', 'CommissionRate', 'Cust_AM', 'CEM', 'Sales', 'In_Out', 'CommissionNotes', 'Distributor', 'Category', 'google_City', 'Billings', 'Cheque_Number', 'Pay_Date', 'searched_address']
 
 INVOICE_RE = re.compile(r"\b9\d{7,8}\b")
-AMOUNT_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d{2})|-?\d+\.\d{2}")
-ACCOUNT_RE = re.compile(r"^(\d{5,6})\s*-\s*(.*)$")
-STATE_CODES = set("AL AK AZ AR CA CO CT DE FL GA IA ID IL IN KS KY LA MA MD ME MI MN MO MS MT NC ND NE NH NJ NM NV NY OH OK OR PA RI SC SD TN TX UT VA VT WA WI WV WY".split())
-SKIP_PREFIXES = (
-    "ZSDB0010", "Agency Name", "Agency No", "Agreement No", "Sales Organization",
+STATE_RE = re.compile(r"\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)\b")
+MONEY_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d{2})")
+ACCOUNT_LINE_RE = re.compile(r"^(\d{5,6})\s*-\s*(.+)$")
+HEADER_SKIP_WORDS = (
+    "ZSDB0010", "Commission Customer Report", "Commission Group Report",
+    "Agency Name", "Agency No.", "Agreement No.", "Sales Organization",
     "Distribution Channel", "Customer Name", "City / State", "Ship To Party",
-    "Customer Totals", "Commission Totals", "Group Description", "Freight / Basis", "Frt Allow"
+    "Customer Totals", "Commission Totals", "Page :", "Time :",
+    "Group Description"
 )
 
 
-def clean_text(value):
+def clean(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def to_number(value):
-    if value in (None, ""):
+    value = clean(value).replace(",", "").replace("$", "")
+    if not value:
         return ""
     try:
-        return float(str(value).replace(",", ""))
+        return float(value)
     except ValueError:
         return value
 
 
-def to_int(value):
-    try:
-        return int(value)
-    except Exception:
-        return value or ""
+def is_header_or_total(line):
+    return any(word in line for word in HEADER_SKIP_WORDS)
 
 
-def blank_row():
-    return {header: "" for header in BOOK4_HEADERS}
+def looks_like_customer_header(line):
+    if is_header_or_total(line):
+        return False
+    if INVOICE_RE.search(line):
+        return False
+    if ACCOUNT_LINE_RE.search(line):
+        return False
+    if re.match(r"^\d{6,}\s+", line):
+        return False
+    return bool(re.search(r"[A-Za-z]", line))
 
 
-def parse_order_line(line, current_city, current_state):
-    tokens = clean_text(line).split()
-    city = current_city
-    state = current_state
+def parse_invoice_line(line):
+    invoice_match = INVOICE_RE.search(line)
+    if not invoice_match:
+        return None
+
+    invoice = invoice_match.group(0)
+    before_invoice = clean(line[:invoice_match.start()])
+    after_invoice = clean(line[invoice_match.end():])
+    nums = MONEY_RE.findall(after_invoice)
+
+    unit_cost = ""
+    unit_resale = ""
+    commission = ""
+
+    if len(nums) >= 5:
+        unit_cost = to_number(nums[0])
+        unit_resale = to_number(nums[2])
+        commission = to_number(nums[-1])
+    elif nums:
+        commission = to_number(nums[-1])
+
+    return {
+        "invoice": invoice,
+        "customer_on_line": before_invoice,
+        "unit_cost": unit_cost,
+        "unit_resale": unit_resale,
+        "commission": commission,
+    }
+
+
+def parse_order_po_line(line):
+    parts = clean(line).split()
     order_no = ""
     po_no = ""
 
-    state_pos = None
-    for i, token in enumerate(tokens):
-        if token in STATE_CODES:
-            state_pos = i
+    if parts and re.fullmatch(r"\d{6,8}", parts[0]):
+        order_no = parts[0]
+    if len(parts) >= 2:
+        po_no = parts[1]
 
-    if state_pos is not None:
-        city = " ".join(tokens[:state_pos])
-        state = tokens[state_pos]
-        after = tokens[state_pos + 1:]
-    else:
-        after = tokens
-
-    if len(after) >= 1:
-        order_no = after[0]
-    if len(after) >= 2 and not re.fullmatch(r"-?\d{1,3}(?:,\d{3})*(?:\.\d{2})|-?\d+\.\d{2}", after[1]):
-        po_no = after[1]
-
-    return city, state, order_no, po_no
+    return order_no, po_no
 
 
-def extract_prime_conduit_rows(uploaded_pdf):
-    all_lines = []
-
-    with pdfplumber.open(uploaded_pdf) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            all_lines.extend([clean_text(line) for line in text.splitlines() if clean_text(line)])
-
+def extract_rows_from_lines(lines):
     rows = []
-    current_customer = ""
+    current_dist = ""
     current_city = ""
     current_state = ""
 
-    for index, line in enumerate(all_lines):
-        if line.startswith(SKIP_PREFIXES):
+    i = 0
+    while i < len(lines):
+        line = clean(lines[i])
+
+        if not line or is_header_or_total(line):
+            i += 1
             continue
 
-        invoice_match = INVOICE_RE.search(line)
-        if not invoice_match:
-            continue
+        parsed = parse_invoice_line(line)
 
-        invoice_number = invoice_match.group(0)
-        customer_before_invoice = clean_text(line[:invoice_match.start()])
-        amount_text = clean_text(line[invoice_match.end():])
-        amounts = AMOUNT_RE.findall(amount_text)
+        if parsed:
+            if parsed["customer_on_line"]:
+                current_dist = parsed["customer_on_line"]
 
-        if len(amounts) < 4:
-            continue
+            next_line = clean(lines[i + 1]) if i + 1 < len(lines) else ""
+            state_match = STATE_RE.search(next_line)
+            city = current_city
+            state = current_state
 
-        if customer_before_invoice:
-            current_customer = customer_before_invoice
-
-        unit_cost = to_number(amounts[2])
-        commission = to_number(amounts[-1])
-        commission_rate = ""
-        rate_match = re.search(r"(\d+(?:\.\d+)?)%", amount_text)
-        if rate_match:
-            commission_rate = f"{rate_match.group(1)}%"
-
-        city = current_city
-        state = current_state
-        order_no = ""
-        po_no = ""
-
-        if index + 1 < len(all_lines):
-            city, state, order_no, po_no = parse_order_line(all_lines[index + 1], current_city, current_state)
-            if city:
+            if state_match:
+                state = state_match.group(1)
+                city = clean(next_line[:state_match.start()])
                 current_city = city
-            if state:
                 current_state = state
 
-        account_number = ""
-        ship_to_name = ""
-        if index + 2 < len(all_lines):
-            account_match = ACCOUNT_RE.match(all_lines[index + 2])
-            if account_match:
-                account_number = account_match.group(1)
-                ship_to_name = clean_text(account_match.group(2))
+            order_no, po_no = parse_order_po_line(next_line)
 
-        row = blank_row()
-        row.update({
-            "Supplier_name": "Prime",
-            "CustAccNbr": to_int(account_number),
-            "CustName": current_customer,
-            "City": city,
-            "State": state,
-            "InvoiceNumber": to_int(invoice_number),
-            "Qty": 1,
-            "UnitCost": unit_cost,
-            "Commissions": commission,
-            "Commission_Rate": commission_rate,
-            "SO_Number": order_no,
-            "PO_Number": po_no,
-            "rawcustname": ship_to_name,
-            "currency": "USD",
-            "meta_data_json": json.dumps({
-                "ship_to_name": ship_to_name,
-                "source_line": line,
-                "order_line": all_lines[index + 1] if index + 1 < len(all_lines) else "",
-                "ship_to_line": all_lines[index + 2] if index + 2 < len(all_lines) else "",
+            cust_acc = ""
+            cust_name = ""
+            for j in range(i + 1, min(i + 5, len(lines))):
+                acc_match = ACCOUNT_LINE_RE.search(clean(lines[j]))
+                if acc_match:
+                    cust_acc = acc_match.group(1)
+                    cust_name = clean(acc_match.group(2))
+                    break
+
+            if not cust_name:
+                cust_name = current_dist
+
+            row = {h: "" for h in FIXED_HEADERS}
+            row.update({
+                "Distname": current_dist,
+                "Supplier_name": "Prime",
+                "direct_indirect": "Indirect",
+                "CustAccNbr": cust_acc,
+                "CustName": cust_name,
+                "City": city,
+                "State": state,
+                "Country": "USA",
+                "InvoiceNumber": parsed["invoice"],
+                "UnitCost": parsed["unit_cost"],
+                "UnitResale": parsed["unit_resale"],
+                "Brand": "Prime Conduit",
+                "rawcustname": cust_name,
+                "Commissions": parsed["commission"],
+                "CommissionRate": "",
+                "Distributor": current_dist,
+                "Billings": parsed["unit_resale"],
             })
-        })
-        rows.append(row)
 
-    # Remove exact duplicate invoice rows if PDF text is repeated.
-    unique = []
+            rows.append(row)
+            i += 1
+            continue
+
+        if looks_like_customer_header(line):
+            current_dist = line
+            if i + 1 < len(lines):
+                nxt = clean(lines[i + 1])
+                sm = STATE_RE.search(nxt)
+                if sm and not INVOICE_RE.search(nxt):
+                    current_city = clean(nxt[:sm.start()])
+                    current_state = sm.group(1)
+
+        i += 1
+
+    return rows
+
+
+def extract_pdf(uploaded_file):
+    all_rows = []
+
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            lines = [clean(x) for x in text.splitlines() if clean(x)]
+            all_rows.extend(extract_rows_from_lines(lines))
+
     seen = set()
-    for row in rows:
-        key = (row["InvoiceNumber"], row["CustAccNbr"], row["SO_Number"], row["UnitCost"], row["Commissions"])
+    unique = []
+    for row in all_rows:
+        key = (row.get("InvoiceNumber"), row.get("CustAccNbr"), row.get("Commissions"))
         if key not in seen:
             seen.add(key)
             unique.append(row)
@@ -200,80 +208,56 @@ def create_excel(rows):
     ws = wb.active
     ws.title = "Extracted Data"
 
-    ws.append(BOOK4_HEADERS)
+    ws.append(FIXED_HEADERS)
 
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-
+    fill = PatternFill("solid", fgColor="FFFF00")
+    font = Font(bold=True)
     for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(horizontal="center")
 
     for row in rows:
-        ws.append([row.get(header, "") for header in BOOK4_HEADERS])
+        ws.append([row.get(h, "") for h in FIXED_HEADERS])
 
-    currency_cols = ["UnitCost", "Commissions", "Billings"]
-    int_cols = ["CustAccNbr", "InvoiceNumber", "Qty", "SO_Number"]
-
-    for col_index, header in enumerate(BOOK4_HEADERS, start=1):
-        letter = get_column_letter(col_index)
-        width = max(12, min(32, len(header) + 2))
-        if header in ["CustName", "rawcustname", "meta_data_json"]:
-            width = 34
-        ws.column_dimensions[letter].width = width
-
-        for cell in ws[letter][1:]:
-            if header in currency_cols:
-                cell.number_format = '#,##0.00'
-            elif header in int_cols:
-                cell.number_format = '0'
+    for idx, header in enumerate(FIXED_HEADERS, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(len(header) + 2, 12), 24)
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
     wb.save(output)
     output.seek(0)
     return output
 
 
 st.title("📊 Prime Conduit PDF Extractor")
-st.write("Upload the Prime Conduit commission report PDF and download a Book4-style Excel output.")
+st.write("Upload Prime Conduit Commission Report PDF(s). Output uses your fixed header only.")
 
-uploaded_files = st.file_uploader(
-    "Upload Prime Conduit PDF file(s)",
-    type=["pdf"],
-    accept_multiple_files=True,
-)
+uploaded_files = st.file_uploader("Upload PDF file(s)", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
     if st.button("Extract Data", type="primary"):
-        all_rows = []
+        rows = []
 
-        with st.spinner("Extracting PDF data..."):
-            for uploaded_file in uploaded_files:
+        with st.spinner("Extracting data..."):
+            for file in uploaded_files:
                 try:
-                    rows = extract_prime_conduit_rows(uploaded_file)
-                    all_rows.extend(rows)
-                    st.success(f"✅ {uploaded_file.name}: {len(rows)} rows extracted")
-                except Exception as error:
-                    st.error(f"❌ {uploaded_file.name}: {error}")
+                    file_rows = extract_pdf(file)
+                    rows.extend(file_rows)
+                    st.success(f"✅ {file.name}: {len(file_rows)} rows extracted")
+                except Exception as e:
+                    st.error(f"❌ {file.name}: {e}")
 
-        if all_rows:
-            st.subheader("Preview")
-            st.dataframe(
-                [{col: row.get(col, "") for col in PREVIEW_COLUMNS} for row in all_rows],
-                use_container_width=True,
-            )
+        if rows:
+            st.dataframe(rows, use_container_width=True)
+            excel_file = create_excel(rows)
 
-            excel_file = create_excel(all_rows)
             st.download_button(
-                label="⬇️ Download Excel File",
+                label="⬇️ Download Excel",
                 data=excel_file,
-                file_name="prime_conduit_extracted_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                file_name="prime_conduit_fixed_output.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.warning("No invoice rows found. Make sure this is a text-based Prime Conduit ZSDB0010 PDF, not a scanned image.")
+            st.warning("No invoice rows found.")
 else:
-    st.info("Upload a PDF to begin.")
+    st.info("Upload PDF file(s) to begin.")
